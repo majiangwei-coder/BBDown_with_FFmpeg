@@ -1,0 +1,29 @@
+# 工具清单: 这里是"别人的东西", 不是我们的代码。
+#
+# 规矩(踩过坑, 写下来免得再犯):
+#   工具部分 —— 原样保留。只允许"整个替换成新版本", 不允许删里面的任何文件。
+#               理由: 发行版少了文件就不再是那个发行版; 而且"我们的代码没调用它"
+#               不等于"它没用"(用户可能自己要用)。
+#   我们的代码 —— 可以改可以删, 但删之前必须说得出是哪一条:
+#                   (a) 这个功能不要了
+#                   (b) 已经被别的东西取代了
+#                   (c) 结构上不再需要了(重构后没有调用点)
+#               三条都说不出, 就是没想清楚 —— 不该删。
+#
+# 关于发布版仓库: 下面列的文件里, BBDown.data / BBDown.data.bak 是登录后生成的,
+# 发布出去的仓库不带它们(git 忽略, 登录一次就有); tools\下载设置.txt 和
+# tools\python_paths.txt 是本机个人文件, 同样不在仓库里 —— 仓库只带
+# tools\下载设置.示例.txt。所以全新 clone 里"清单有、文件没有"是正常的。
+#
+# 格式: 路径 <TAB> 说明。路径相对 tools\ (也就是 PROJ)。目录写目录名即可,
+#       目录里面的文件不用逐个列(它们属于发行版自己)。
+#       以 # 开头的是注释。
+#
+# 换了新版本的 ffmpeg 就在这里改对应那行(例如换成 ffmpeg-9.0-full_build),
+# 然后跑: python tools\清点工具与代码.py
+
+BBDown.exe	BBDown 下载器本体(第三方发行版, 版本看 --help 或 tools\BBDown.config 注释)
+ffmpeg-8.0-full_build	FFmpeg 8.0-full_build 完整发行版(gyan.dev, 含 ffmpeg/ffprobe/ffplay + doc + presets)
+BBDown.data	登录 cookie(程序生成, 但删了就必须重新扫码登录)
+BBDown.data.bak	cookie 的备份(登录流程自动生成, 保留可回滚)
+BBDown.config	BBDown 自己的配置文件(写在这里的参数会作为命令行参数传给 BBDown)

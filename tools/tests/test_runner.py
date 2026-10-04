@@ -405,12 +405,31 @@ class TestHeartbeatText(unittest.TestCase):
         self.assertIn("第 3 轮运行中 15分00秒", text)
         self.assertIn("成功 7", text)
         self.assertIn("超时掐掉 2", text)
-        self.assertIn("正在下 2 个", text)
+        self.assertIn("在下的 2 个", text)
         self.assertIn("某某合集直播(已 6分40秒)", text)     # 最久的排最前面
 
+    def test_heartbeat_is_split_into_short_lines(self):
+        """心跳要拆行: 数字一行, 标题另一行.
+
+        用户反馈的"看着像缺字": 原来全挤在一行, 窄窗口会在宽度处折行,
+        "朴孝敏(已 26秒)" 被切成 "…朴孝敏(已 26秒" + 下一行 ")", 看着像缺字;
+        更长的还会被窗口直接截掉。拆开之后第一行很短很稳, 标题再长也只影响
+        第二行 —— 数字永远不会被折走或截掉。
+        """
+        result = runner.RoundResult()
+        active = {"1": ("一个特别特别长的视频标题会被截断成二十个字", 0.0, "x")}
+        lines = runner.heartbeat_lines(1, 45, result, active, 26.0)
+        self.assertEqual(len(lines), 2, "有在下的视频时应该是两行")
+        self.assertLessEqual(len(lines[0]), 48,
+                             "第一行太长就会折行, 折了就又看着像缺字了")
+        self.assertIn("在下的 1 个", lines[0])
+        self.assertNotIn("(已 ", lines[0], "时间信息应该在第二行")
+        self.assertIn("(已 26秒)", lines[1], "时间要完整地待在第二行")
+
     def test_heartbeat_when_nothing_running(self):
-        text = runner.heartbeat_text(1, 10, runner.RoundResult(), {}, 100.0)
-        self.assertIn("当前没有在下的视频", text)
+        lines = runner.heartbeat_lines(1, 10, runner.RoundResult(), {}, 100.0)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("当前没有在下的视频", lines[1])
 
     def test_heartbeat_includes_disk_growth(self):
         """落盘速度是"真的在下"最硬的证据(BBDown 进度是回车刷新的, 看不到)."""

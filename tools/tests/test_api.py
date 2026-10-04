@@ -193,9 +193,15 @@ class TestIncrementalSync(TempRootTest):
             {"aid": "2", "bvid": "BV2", "title": "第二个"},
             {"aid": "1", "bvid": "BV1", "title": "第一个"},
         ]
+        # 全量时间要用**刚刚**, 不能写死日期: 同步逻辑里有一条
+        # "已超过 full_days 天没做完整校验 -> 改为完整拉取", 写死的日期
+        # 过几天就会变成"很久以前", 于是全部用例都掉进全量分支 ——
+        # 实测这个坑让两个用例在 10-03 那天开始必失败(写死的 09-26 超过 7 天),
+        # 而看起来像是同步逻辑坏了。
+        from bbdown_kit.util import now_str
         meta = meta if meta is not None else {
             "最新aid": videos[0]["aid"], "视频总数": len(videos),
-            "列表完整": True, "全量时间": "2026-09-26 17:53:31",
+            "列表完整": True, "全量时间": now_str(),
             "同步方式": "全量",
         }
         return write_state(up, videos, meta=meta)

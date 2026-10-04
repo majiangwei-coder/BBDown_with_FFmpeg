@@ -92,7 +92,25 @@ class RoundResult(object):
 
 
 def heartbeat_text(round_no, round_elapsed, result, active, now, progress=None):
-    """一行心跳, 回答"它还在跑吗? 在跑哪个? 跑了多久?". 纯函数, 方便测试."""
+    """一行心跳, 回答"它还在跑吗? 在跑哪个? 跑了多久?".
+
+    这是**单行**版本(旧调用点和测试都按单行用)。要看人的话用
+    heartbeat_lines() —— 它拆成两行, 免得在窄窗口里折行。
+    """
+    return "; ".join(heartbeat_lines(round_no, round_elapsed, result, active,
+                                     now, progress))
+
+
+def heartbeat_lines(round_no, round_elapsed, result, active, now, progress=None):
+    """心跳, 拆成 1~2 行. 返回字符串列表.
+
+    为什么拆(用户反馈的一个"看着像缺字"的问题):
+        原来所有东西拼成一行, 窄一点的窗口就会在宽度处**折行**, 于是
+        "朴孝敏(已 26秒)" 被切成 "…朴孝敏(已 26秒" + 下一行 ")" —— 看起来
+        像日志缺字; 更长的还会被窗口直接截掉(截图里就截掉了)。
+        拆开之后: 第一行只放数字(短、稳), 第二行才放标题(长、会折也不影响
+        看数字)。这样即使折行, 折的也是标题那部分, 关键信息永远完整。
+    """
     parts = ["第 %d 轮运行中 %s" % (round_no, elapsed_text(round_elapsed)),
              "成功 %d" % result.downloads,
              "失败 %d" % result.fails]
@@ -101,18 +119,24 @@ def heartbeat_text(round_no, round_elapsed, result, active, now, progress=None):
     if result.unplayable:
         parts.append("充电专属跳过 %d" % result.unplayable)
     if active:
+        parts.append("在下的 %d 个" % len(active))
+    lines = ["; ".join(parts)]
+    if active:
         running = sorted(active.items(), key=lambda kv: kv[1][1])
-        parts.append("正在下 %d 个" % len(active))
         who = "、".join("%s(已 %s)" % (entry[0][:20], elapsed_text(now - entry[1]))
                         for _aid, entry in running[:2])
         if len(active) > 2:
             who += " 等"
-        parts.append("最久: " + who)
+        tail = "在下的: " + who
+        if progress:
+            tail += "; " + progress
+        lines.append(tail)
     else:
-        parts.append("当前没有在下的视频(正在刷新名单/准备下一批)")
-    if progress:
-        parts.append(progress)
-    return "; ".join(parts)
+        # 这句别删: 它区分"在下小文件/没动静"和"真的什么都没干"。
+        # 第二行, 所以再长也不会把上面的数字挤到折行。
+        lines.append("当前没有在下的视频(正在刷新名单/准备下一批)"
+                     + ("; " + progress if progress else ""))
+    return lines
 
 
 # ---------------- 事件读取 ----------------
@@ -461,10 +485,12 @@ def run_round(manager_cmd, round_no, quarantined, log_dir, round_log_path,
                 progress = "这 %.0f 秒没长个儿(可能在下小文件或真的卡了)" % secs
         live["last_bytes"], live["last_bytes_ts"] = now_bytes, now
         live["last_beat"] = now
-        line = heartbeat_text(round_no, now - started, result, live["active"],
-                              now, progress)
-        log(line)
-        refresh_status("状态: " + line)
+        # 拆成两行写: 数字一行(短), 在下的另起一行(标题长, 折行也不影响数字)
+        hb_lines = heartbeat_lines(round_no, now - started, result,
+                                   live["active"], now, progress)
+        for item in hb_lines:
+            log(item)
+        refresh_status("状态: " + "; ".join(hb_lines))
 
     def _warn_slow(now):
         for aid_key, entry in sorted(live["active"].items(),

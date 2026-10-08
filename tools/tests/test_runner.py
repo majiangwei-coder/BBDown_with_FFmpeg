@@ -310,6 +310,110 @@ sys.exit(0)
         self.assertEqual(result.fail_kinds.get("多线程"), 3)
         self.assertEqual(result.fail_kinds.get("风控"), 1)
 
+    def test_vague_parse_failure_is_confirmed_by_the_api(self):
+        """BBDown 只说了句"解析此分P失败": 守护要自己去问接口 —— 问出风控就得休息.
+
+        实测(2026-10-08 01:44): 账号被风控的那几分钟里 56 个视频全报
+        "解析此分P失败", 而 BBDown 的输出当时是乱码, 于是原因被记成"无成片",
+        守护看不出自己在被拦: 既不休息, 也不撤回这一轮写进「跳过」的条目。
+        """
+        self.install_manager('''# -*- coding: utf-8 -*-
+import json, sys
+path = sys.argv[sys.argv.index('--event-log') + 1]
+
+
+def emit(**kw):
+    open(path, 'a', encoding='utf-8').write(
+        json.dumps(kw, ensure_ascii=False) + "\\n")
+
+
+for i in range(4):
+    emit(kind="video_end", aid="700%d" % i, title="说不清的视频%d" % i,
+         ok=False, rc=0, new_file=False, reason="解析",
+         reason_text="解析分P失败(BBDown 拿不到这一路的播放地址)")
+emit(kind="run_end", downloaded=0, failed=4)
+sys.exit(0)
+''', folder_name="vague-parse")
+        with mock.patch.object(runner.bilitools, "video_unplayable",
+                               lambda aid: False), \
+                mock.patch.object(runner.bilitools, "can_probe_api",
+                                  lambda: True), \
+                mock.patch.object(runner.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (-352, False)):
+            _start, result = self.run_round()
+        self.assertIsNotNone(result.killed_reason,
+                             "接口说 -352(风控) 就该判定被拦、去休息")
+        self.assertIn("风控", result.killed_reason)
+        self.assertGreaterEqual(result.consec_fail, runner.FAIL_BURST)
+
+    def test_voucher_without_streams_is_recorded_but_does_not_rest(self):
+        """接口只给验证凭证、没有流: 原因要记准, 但不判"被拦".
+
+        实测(2026-10-08 02:00): 被风控挑战时播放接口返回 code=0 但只有
+        v_voucher、一条流都没有, 而同一个窗口里 BBDown 靠兑换凭证**下成了**
+        191 个视频 —— 账号不是被拦死, 只是有一批撞在挑战上。所以这条按"解析"
+        记下来(写清是验证凭证), 管理器自己会连续失败降速, 下一轮再重试;
+        真被拦死时接口会直接给 -352/-412, 那条路照旧休息。
+        """
+        self.install_manager('''# -*- coding: utf-8 -*-
+import json, sys
+path = sys.argv[sys.argv.index('--event-log') + 1]
+
+
+def emit(**kw):
+    open(path, 'a', encoding='utf-8').write(
+        json.dumps(kw, ensure_ascii=False) + "\\n")
+
+
+for i in range(6):
+    emit(kind="video_end", aid="500%d" % i, title="撞挑战的%d" % i,
+         ok=False, rc=0, new_file=False, reason="解析",
+         reason_text="解析分P失败(BBDown 拿不到这一路的播放地址)")
+emit(kind="run_end", downloaded=0, failed=6)
+sys.exit(0)
+''', folder_name="voucher")
+        with mock.patch.object(runner.bilitools, "video_unplayable",
+                               lambda aid: False), \
+                mock.patch.object(runner.bilitools, "can_probe_api",
+                                  lambda: True), \
+                mock.patch.object(runner.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (0, False)):
+            _start, result = self.run_round()
+        self.assertIsNone(result.killed_reason, "还有得下, 不该整个停下来")
+        self.assertEqual(result.consec_fail, 0)
+        self.assertEqual(result.fail_kinds.get("解析"), 6)
+        self.assertIn("验证凭证", result.last_fail_note)
+
+    def test_vague_parse_failure_with_playable_video_does_not_rest(self):
+        """接口说视频好好的(code=0) -> 那就是真解析不了, 绝不能判限流."""
+        self.install_manager('''# -*- coding: utf-8 -*-
+import json, sys
+path = sys.argv[sys.argv.index('--event-log') + 1]
+
+
+def emit(**kw):
+    open(path, 'a', encoding='utf-8').write(
+        json.dumps(kw, ensure_ascii=False) + "\\n")
+
+
+for i in range(6):
+    emit(kind="video_end", aid="600%d" % i, title="真解析不了的%d" % i,
+         ok=False, rc=0, new_file=False, reason="解析",
+         reason_text="解析分P失败(BBDown 拿不到这一路的播放地址)")
+emit(kind="run_end", downloaded=0, failed=6)
+sys.exit(0)
+''', folder_name="vague-parse-ok")
+        with mock.patch.object(runner.bilitools, "video_unplayable",
+                               lambda aid: False), \
+                mock.patch.object(runner.bilitools, "can_probe_api",
+                                  lambda: True), \
+                mock.patch.object(runner.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (0, True)):
+            _start, result = self.run_round()
+        self.assertIsNone(result.killed_reason, "视频是好的是我们解析不了, 不是被拦")
+        self.assertEqual(result.consec_fail, 0)
+        self.assertEqual(result.fail_kinds.get("解析"), 6)
+
     def test_charging_failure_is_not_counted_as_rate_limit(self):
         """充电专属的失败不算限流, 而且要进永久失败名录."""
         self.install_manager('''# -*- coding: utf-8 -*-
@@ -378,6 +482,124 @@ class TestManagerCapabilityProbe(RealProjectTest):
     def test_missing_manager_is_false(self):
         self.assertFalse(runner.manager_supports_events(
             os.path.join(self.tmp, "没有这个文件.py")))
+
+
+class TestDiskGrowth(unittest.TestCase):
+    """"落盘 +xx MB(约 x MB/s)" 是怎么算出来的.
+
+    这块出过一次很离谱的错: 日志里出现过 `落盘 +97.91 GB(46 秒, 约 2.13 GB/s)`
+    —— 比宽带物理带宽高几十倍。原因不是下载真的那么快, 而是统计方式:
+    在下的文件夹一换(一个 UP主 下完、开始下一个), 就把"新文件夹的存量"当成了
+    这 46 秒的增长。所以这里的用例都盯着"换文件夹"这个场景。
+    """
+
+    MB = 1048576
+
+    def growth(self, before, now, secs=45, **kw):
+        """按 _beat 里的算法算一遍 -> 那句落盘文字."""
+        comparable = [f for f in now if f in before]
+        delta = sum(now[f] - before[f] for f in comparable)
+        fresh = len(now) - len(comparable)
+        return runner.disk_growth_text(delta, secs, fresh, bool(comparable),
+                                       kw.get("average"))
+
+    def test_same_folders_report_real_growth(self):
+        before = {r"G:\a": 100 * self.MB}
+        now = {r"G:\a": 100 * self.MB + 5 * self.MB}
+        text = self.growth(before, now)
+        self.assertIn("落盘 +5.0 MB", text)
+        self.assertIn("约 113.8 KB/s", text)
+
+    def test_new_folder_does_not_inflate_the_number(self):
+        """换文件夹时不许把新文件夹的存量当成这几十秒下的.
+
+        实测那次: 上一个 UP主 的文件夹只剩 1 个视频, 新 UP主 的文件夹本地已经
+        有 97.91 GB —— 一减就成了"2.13 GB/s"。事后复现: 老文件夹 5.52 GB、
+        新换进来的 105.25 GB, 差 99.73 GB。
+        """
+        before = {r"G:\上一个UP": 5520 * self.MB}
+        now = {r"G:\新UP": 105 * 1024 * self.MB}
+        text = self.growth(before, now, 46)
+        self.assertNotIn("落盘 +", text, "没有可比基准就不能报数字")
+        self.assertNotIn("GB/s", text)
+        self.assertIn("下一次心跳才有落盘数字", text)
+
+    def test_growth_of_kept_folders_is_still_reported(self):
+        """换了文件夹但有一个是原来就量过的: 报它的增长, 并说明还有没算进来的."""
+        before = {r"G:\老UP": 100 * self.MB}
+        now = {r"G:\老UP": 100 * self.MB + 3 * self.MB,
+               r"G:\新UP": 97 * 1024 * self.MB}
+        text = self.growth(before, now, 46)
+        self.assertIn("落盘 +3.0 MB", text)
+        self.assertNotIn("97", text)
+        self.assertIn("另有 1 个文件夹刚开始下, 没算进来", text)
+
+    def test_folder_leaving_the_set_is_not_reported_as_no_growth(self):
+        """集合里少了个大文件夹 -> 差值变负, 以前会误报"没长个儿(可能卡了)"."""
+        before = {r"G:\a": 200 * self.MB, r"G:\b": 500 * 1024 * self.MB}
+        now = {r"G:\a": 200 * self.MB + self.MB}         # b 下完了, 已退出集合
+        text = self.growth(before, now)
+        self.assertIn("落盘 +1.0 MB", text, "还在下的那个确实在长")
+
+    def test_really_no_growth_still_says_so(self):
+        """同一个文件夹两次都量过、真的没长: 这句要保留(它是排查卡住的依据)."""
+        before = {r"G:\a": 100 * self.MB}
+        text = self.growth(before, {r"G:\a": 100 * self.MB})
+        self.assertIn("没长个儿", text)
+
+    def test_steady_state_is_not_counted_twice(self):
+        """稳态一跳: 下 100 分片 + 合并出 95 成片 + 删掉上一批的 100 分片.
+
+        真实下载量是 100(新分片), 净增长报 95 —— 对得上(成片比它的分片略小)。
+        只加正数会报 195, 差不多两倍。本库视频多在 20 MB 上下、合并极频繁,
+        所以那是系统性翻倍, 不是偶发抖动。
+        """
+        before = {r"G:\a": 400 * self.MB}
+        now = {r"G:\a": 400 * self.MB
+               - 100 * self.MB        # 上一批分片被删掉
+               + 100 * self.MB        # 这一跳新下的分片
+               + 95 * self.MB}        # 合并出来的成片
+        text = self.growth(before, now)
+        self.assertIn("落盘 +95.0 MB", text)
+        self.assertNotIn("195", text)
+
+    def test_merge_cycle_sums_back_to_the_truth(self):
+        """一整圈(下分片 -> 合并 -> 删分片)加起来的净增长 = 真实新增.
+
+        单跳会有抖动: 合并那一跳偏高(分片还在)、删分片那一跳偏低 —— 所以心跳
+        旁边给了"本轮平均"当参照。但一圈的总和必须是真实新增, 不能凭空多出来。
+        """
+        empty = {r"G:\a": 0}
+        downloaded = {r"G:\a": 100 * self.MB}                  # 分片下完
+        merged = {r"G:\a": 195 * self.MB}                      # 合并(分片还在)
+        cleaned = {r"G:\a": 95 * self.MB + 60 * self.MB}       # 删分片 + 又下 60
+        deltas = [
+            sum(downloaded[f] - empty[f] for f in downloaded),
+            sum(merged[f] - downloaded[f] for f in merged),
+            sum(cleaned[f] - merged[f] for f in cleaned),
+        ]
+        self.assertEqual(deltas[1], 95 * self.MB, "合并那一跳就是会偏高")
+        self.assertLess(deltas[2], 0, "删分片那一跳必须减掉, 否则合并被算了两次")
+        self.assertEqual(sum(deltas), 155 * self.MB,
+                         "真实新增 = 成片 95 + 新分片 60; 一圈之和必须等于它")
+
+    def test_average_is_the_reference_that_cannot_exceed_bandwidth(self):
+        """单跳会被合并带高, 所以旁边给一个本轮平均当参照."""
+        before = {r"G:\a": 100 * self.MB}
+        now = {r"G:\a": 100 * self.MB + 900 * self.MB}
+        text = self.growth(before, now, 45, average=6 * self.MB)
+        self.assertIn("落盘 +900.0 MB", text)
+        self.assertIn("本轮平均 6.0 MB/s", text)
+
+    def test_nothing_active_is_silent(self):
+        """没有在下的视频: 不报落盘(那行本来就在说"正在刷新名单/准备下一批")."""
+        self.assertIsNone(runner.heartbeat_lines(1, 10, runner.RoundResult(),
+                                                 {}, 100.0)[1].count("落盘") or None)
+
+    def test_first_beat_says_it_has_no_baseline_yet(self):
+        text = self.growth({}, {r"G:\a": 500 * self.MB})
+        self.assertIn("下一次心跳才有落盘数字", text)
+        self.assertNotIn("落盘 +", text)
 
 
 class TestHeartbeatText(unittest.TestCase):

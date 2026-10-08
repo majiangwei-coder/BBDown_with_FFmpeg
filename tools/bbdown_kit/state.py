@@ -498,18 +498,51 @@ def record_count(folder):
     return len(legacy) if isinstance(legacy, dict) else 0
 
 
-def pending_count(folder):
-    """这份名单大概还差多少个(只读记录不扫文件) —— 用来给任务排序."""
+def pending_summary(folder):
+    """读一次状态文件, 把排序要的几个数一次算出来.
+
+        count         还差多少条(名单里有、既没下过也没跳过)
+        seconds       这些待下载的视频里**已知时长**的合计(秒)
+        known         上面那个合计是几条的
+        list_seconds  名单里**所有**知道时长的视频合计(含已下载的)
+        list_known    上面那个合计是几条的
+
+    为什么要后两个: "这份名单里一个视频大概多长"用整份名单来算最实在 ——
+    刚做完完整校验的名单时长是全的, 只做过增量同步的名单只有新视频有;
+    待下载的那部分单拎出来往往样本太少(甚至一条都没有)。
+    时长来自列表接口(videos 条目里的 "duration", 见 bilitools), 老状态文件里
+    没有就是 0, 排序那边会退回"按条数排"。
+    """
     data = _read_json(paths.state_file(folder))
+    blank = {"count": 0, "seconds": 0, "known": 0,
+             "list_seconds": 0, "list_known": 0}
     if not isinstance(data, dict):
-        return 0
+        return dict(blank)
     record = _as_dict(data.get(S_RECORD))
     skip = _as_dict(data.get(S_SKIP))
     # 名单条目也可能是手工改坏的(字符串/数字)。这个函数守护每轮都调,
     # 崩了就是整轮作废, 所以先确认它是个对象。
-    return sum(1 for v in _as_list(data.get(S_VIDEOS))
-               if isinstance(v, dict) and v.get("aid")
-               and v["aid"] not in record and v["aid"] not in skip)
+    out = dict(blank)
+    for v in _as_list(data.get(S_VIDEOS)):
+        if not isinstance(v, dict) or not v.get("aid"):
+            continue
+        length = to_int(v.get("duration"), 0) or 0
+        if length > 0:
+            out["list_seconds"] += length
+            out["list_known"] += 1
+        aid = v["aid"]
+        if aid in record or aid in skip:
+            continue
+        out["count"] += 1
+        if length > 0:
+            out["seconds"] += length
+            out["known"] += 1
+    return out
+
+
+def pending_count(folder):
+    """这份名单大概还差多少个(只读记录不扫文件) —— 用来给任务排序."""
+    return pending_summary(folder)["count"]
 
 
 def ensure_single_list(folder):

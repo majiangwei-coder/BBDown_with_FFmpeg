@@ -9,22 +9,48 @@
     · 累计失败 2 次       -> 进「跳过」(下次要重试必须在菜单按 R 或加 --retry-skip)
     · 接口确认充电/付费专属 -> 直接进「跳过」(反正永远下不了)
     · 被限流打断的一轮    -> 由守护把这一轮新写进「跳过」的条目撤回
+    · 接口正在风控挑战时  -> **不进**「跳过」(见 account_level_failure):
+                            那是账号层面的事, 不该算到具体视频头上
 """
 
 import datetime
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 
 from . import bilitools, failures, lockstep, media, paths, procs, workdirs
-from .logging import emit, highlight, log
+from .logging import decode_line, emit, highlight, log
 from .state import TIME_LOCAL_EXISTS, State
 from .util import elapsed_text, now_str
 
 # 单个视频最多下多久(分钟)。超时就结束它, 下次自动重试。
 DEFAULT_DOWNLOAD_TIMEOUT_MIN = 30
+
+# BBDown 的换行有 \r\n(\n 也有, 进度还是 \r 刷新的)
+_LINE_END = re.compile(rb"\r\n|\r|\n")
+
+
+def split_output(buf):
+    """BBDown 的原始字节 -> (完整行的文本列表, 还没结束的尾巴).
+
+    两个坑都在这里解决:
+
+    · **编码不固定**: BBDown(.NET) 按控制台代码页写 —— cp936 的窗口写 GBK,
+      `chcp 65001` 的窗口写 UTF-8。以前这里是 `encoding="utf-8",
+      errors="replace"`, GBK 那半边全变成 U+FFFD: 实测一轮日志里 **6 万个
+      替换字符**(BBDown 的每一行都成了乱码), 更要命的是**失败原因也跟着认不出来**
+      —— 56 个"解析此分P失败"全被记成"无成片", 于是守护看不出自己正被风控,
+      既不休息也不撤回这一轮写进「跳过」的条目。
+      现在逐行认编码(先 UTF-8 再 GB18030, 见 logging.decode_line)。
+    · **进度是 \\r 刷新的**: 二进制模式没有 universal newlines, 得自己按 \\r 切,
+      否则一条进度条会攒成一大坨(以前文本模式会自动断开)。
+    """
+    parts = _LINE_END.split(buf)
+    tail = parts.pop()          # 最后一段可能还没结束, 留着等下一次
+    return [decode_line(part) for part in parts], tail
 
 
 # ---------------- 跑一次 BBDown ----------------
@@ -89,15 +115,25 @@ class _Tail(object):
             self._pending = ""
 
     def _pump(self, pipe):
+        """按行读 BBDown 的输出(字节), 认编码之后转发 + 认信号."""
+        buf = b""
         try:
             while True:
-                chunk = pipe.readline()
+                chunk = pipe.read(4096)
                 if not chunk:
                     break
-                self.feed(chunk)
+                if isinstance(chunk, str):      # 万一传进来的是文本管道
+                    self.feed(chunk)
+                    continue
+                buf += chunk
+                lines, buf = split_output(buf)
+                for line in lines:
+                    self.feed(line + "\n")
         except Exception:
             pass
         finally:
+            if buf:
+                self.feed(decode_line(buf))
             try:
                 pipe.close()
             except Exception:
@@ -138,6 +174,36 @@ class _Tail(object):
         return failures.pick(self.signals())
 
 
+def account_level_failure(aid, throttle=None):
+    """这次失败是"账号层面"的(正在被限流/风控挑战), 还是这个视频本身有问题?
+
+    两个判据, 任一成立就算账号层面 —— 这种失败**不该写进「跳过」**:
+
+    · **管理器自己正在降速**(连续失败到了阈值 / 还在冷却里): 那是它自己的限流
+      判定, 说明现在撞的是一堵墙, 不是某个视频的毛病。
+    · **接口现在只给验证凭证**(返回码 0 但一条流都没有 = v_voucher 风控挑战)。
+
+    为什么必须区别对待(实测 2026-10-08 凌晨): 挑战是一阵一阵来的, 一轮里能撞掉
+    300 多个视频, 而**同一个窗口里 BBDown 还能下成一大半** —— 照"累计失败 2 次
+    就进跳过"办, 这一轮过去就平白丢几百个视频。守护那边的撤回机制只在它自己
+    判定"被限流"时才动, 这两种情况它都看不到(接口返回码一直是 0)。
+
+    代价只是"晚一点再判它没救": 等这堵墙过去了, 真下不了的视频照样会在两次
+    失败后进「跳过」(那时 throttle 恢复、接口也能给流)。探不到/没登录一律
+    按老规矩走, 不去猜。
+    """
+    if throttle is not None and (throttle.backoff_level > 0
+                                 or throttle.cooling_down()):
+        return True
+    if not bilitools.can_probe_api():
+        return False
+    try:
+        code, has_stream = bilitools.playurl_probe(aid)
+    except Exception:
+        return False
+    return code == 0 and has_stream is False
+
+
 def run_bbdown(url, folder, extra_args, timeout=None, aid=None, sink=None):
     """跑一次 BBDown. timeout(秒) 到了还没下完就结束它.
 
@@ -162,10 +228,10 @@ def run_bbdown(url, folder, extra_args, timeout=None, aid=None, sink=None):
     # 一边留最后几行下来当"失败原因"。
     # 拿不到 stdout(某些替身/极端情况)就退回"让它自己往控制台写", 功能不受影响,
     # 只是这次没有失败原因可记 —— 绝不能因为记不了原因就不下载。
+    # 注意读的是**字节**(bufsize=0): 编码逐行认, 不能在这里写死(见 split_output)。
     try:
         proc = subprocess.Popen(cmd, cwd=paths.PROJ, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
-                                encoding="utf-8", errors="replace", bufsize=1)
+                                stderr=subprocess.STDOUT, bufsize=0)
     except FileNotFoundError:
         log("找不到 BBDown.exe, 请确认它和本程序在同一目录")
         return 1
@@ -437,6 +503,14 @@ def download_video_list(folder, st, args, stats, who="该UP主",
         failed_this_round.append((video["aid"], video["title"]))
         count = st.mark_failed(video["aid"], video["title"], when=now_str(),
                                reason=reason[1])
+        # 这次失败是"账号层面"的吗(被限流/风控挑战)? 是的话踩一脚刹车 ——
+        # 实测那种挑战按时间窗来(好一分钟坏几分钟), 坏窗口里继续撞几乎全是白撞。
+        # 判据本身很便宜: 管理器已经在降速时直接返回, 否则才去问一次接口。
+        blocked = account_level_failure(video["aid"], throttle)
+        if blocked:
+            pause = throttle.pause_for_block()
+            log("撞上账号层面的限流/风控挑战(第 %d 次): 暂停 %s 再继续"
+                % (throttle.block_level, elapsed_text(pause)))
         # 把原因也说出来(以前只有"失败"两个字, 事后完全查不出为什么)
         why_text = ""
         if reason[1]:
@@ -444,6 +518,16 @@ def download_video_list(folder, st, args, stats, who="该UP主",
             tip = failures.advice(reason[0])
             if tip:
                 why_text += " -> %s" % tip
+        if count >= 2 and blocked:
+            # 账号正在被限流/风控挑战(接口只给验证凭证, 或管理器自己已经在降速):
+            # 这不是这个视频的毛病, 不能让它进「跳过」—— 留在「失败」里,
+            # 这堵墙过去了下一轮接着下。
+            st.save()
+            log("(%d/%d) 失败 ✗ %s (第%d次失败: 现在是账号层面的限流/风控挑战, "
+                "先不进跳过列表, 下次重试) [用时 %s, 平均 %s/个]%s"
+                % (done, total_count, highlight(video["title"], "red"), count,
+                   elapsed_text(took), elapsed_text(avg), why_text))
+            return False
         if count >= 2:
             st.move_failed_to_skip(video["aid"])
             st.save()

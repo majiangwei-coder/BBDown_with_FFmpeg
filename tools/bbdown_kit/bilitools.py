@@ -552,18 +552,54 @@ def resolve_video(session, text):
 
 # ---------------- 投稿列表 ----------------
 
+def duration_of(item):
+    """列表接口条目里的视频时长(秒); 认不出来返回 None.
+
+    两个接口给的东西**不一样**, 都在这里认掉, 别处只拿秒数(实测各打了一次
+    真实请求看到的):
+
+        投稿列表 arc/search          -> "length": "00:07"   字符串, 要自己拆
+        合集 seasons_archives_list   -> "duration": 199     直接是秒
+
+    时长只用来排队(见 duration 模块): 认不出来就当"这份名单还没这个数据",
+    绝不影响"这个视频下不下"。所以这里宁可返回 None, 也不瞎猜一个数。
+    """
+    seconds = to_int(item.get("duration"))
+    if seconds and seconds > 0:
+        return seconds
+    text = str(item.get("length") or "").strip()
+    parts = text.split(":")
+    if not 1 <= len(parts) <= 3:
+        return None
+    total = 0
+    for part in parts:                 # "1:02:03" -> 3723
+        num = to_int(part.strip())
+        if num is None or num < 0:
+            return None
+        total = total * 60 + num
+    return total or None
+
+
 def parse_page_items(data):
     """从 arc/search 的响应里取出 (本页视频列表, 投稿总数)."""
     payload = data.get("data") or {}
     vlist = (payload.get("list") or {}).get("vlist") or []
     items = []
     for v in vlist:
-        if v.get("aid"):
-            items.append({
-                "aid": str(v["aid"]),
-                "bvid": clean_text(v.get("bvid", "")),
-                "title": clean_text(v.get("title", "")),
-            })
+        if not v.get("aid"):
+            continue
+        entry = {
+            "aid": str(v["aid"]),
+            "bvid": clean_text(v.get("bvid", "")),
+            "title": clean_text(v.get("title", "")),
+        }
+        seconds = duration_of(v)
+        if seconds:
+            # 顺手存下来: 一次列表请求就把整页的时长带回来了, 不额外发请求。
+            # 老状态文件里没有这个字段 —— 要等这份名单下一次完整校验才补齐,
+            # 补齐之前按时长排会退化成按个数排(见 duration 模块)。
+            entry["duration"] = seconds
+        items.append(entry)
     return items, to_int((payload.get("page") or {}).get("count"), 0)
 
 
@@ -863,18 +899,22 @@ def sync_videos(session, key, mid, st, full_days=7, force_full=False,
 # 这些不进投稿接口, 只有合集接口能看到。
 
 def parse_archive_items(items):
-    """合集/系列接口的条目 -> 和投稿列表一样的 {aid, bvid, title}."""
+    """合集/系列接口的条目 -> 和投稿列表一样的 {aid, bvid, title}(+时长)."""
     out = []
     for v in items or []:
         aid = v.get("aid")
         if not aid:
             continue
         title = clean_text(v.get("title") or "").strip()
-        out.append({
+        entry = {
             "aid": str(aid),
             "bvid": clean_text(v.get("bvid", "")),
             "title": title or ("av%s" % aid),
-        })
+        }
+        seconds = duration_of(v)
+        if seconds:
+            entry["duration"] = seconds
+        out.append(entry)
     return out
 
 
@@ -1019,33 +1059,62 @@ def video_unplayable(aid):
     return unplayable
 
 
-def playurl_code(aid, cid=None):
-    """用 BBDown 同款接口(wbi playurl)看现在的返回码. 0=能下, 87008=被拦."""
+def playurl_probe(aid, cid=None):
+    """像 BBDown 一样问一次播放接口 -> (返回码, 有没有流).
+
+    **为什么要看"有没有流", 不能只看返回码**: 被风控挑战时, 这个接口会返回
+    `code=0` 但 data 里**只有一个 v_voucher(验证凭证)**, 一条流都没有。实测
+    2026-10-08 02:00 连问四个视频全是这样(全部 dash/durl 缺失), 而同一时间
+    BBDown 那边正在报"解析此分P失败"。只看 code 会把"正在被风控挑战"读成
+    "一切正常" —— 守护原来那句"现在同一个接口返回码=0 (0=已放行)"就是这么骗人的。
+    """
     session = api_session()
     if session is None:
-        return None
+        return None, None
     try:
         if not cid:
             data = session.get(API_VIEW, params={"aid": aid}, timeout=15).json()
             cid = (data.get("data") or {}).get("cid")
         if not cid:
-            return None
+            return None, None
         key = mixin_key(session)
         if not key:
-            return None
+            return None, None
         params = wbi_sign({
             "avid": aid, "cid": cid, "fnval": 4048, "fnver": 0,
             "fourk": 1, "otype": "json", "qn": 0,
         }, key)
         data = session.get(API_PLAYURL, params=params, timeout=15).json()
-        return data.get("code")
     except Exception:
-        return None
+        return None, None
+    code = data.get("code")
+    inner = data.get("data") or {}
+    has_stream = bool((inner.get("dash") or {}).get("video")) \
+        or bool(inner.get("durl"))
+    return code, has_stream
+
+
+def playurl_code(aid, cid=None):
+    """用 BBDown 同款接口(wbi playurl)看现在的返回码. 0=接口没报错(不等于有流).
+
+    要看"到底能不能下"用 playurl_probe —— 被风控挑战时返回码也是 0。
+    """
+    return playurl_probe(aid, cid)[0]
 
 
 def playurl_ok(aid, cid=None):
-    """True = 和 BBDown 一样的接口现在能过."""
-    return playurl_code(aid, cid) == 0
+    """True = 和 BBDown 一样的接口现在真能给到流."""
+    code, has_stream = playurl_probe(aid, cid)
+    return code == 0 and has_stream is True
+
+
+def can_probe_api():
+    """现在能不能"自己去问一次接口"(有没有登录 cookie).
+
+    没登录时问出来的码是"未登录(-101)"之类, **不是**"被风控"的证据 —— 拿它当
+    判据会把守护带沟里。顺带一个好处: 离线测试里不会真的发请求出去。
+    """
+    return bool(load_cookie())
 
 
 def playurl_media_url(aid, cid=None):
@@ -1113,7 +1182,11 @@ def download_path_ok(aid, cid=None, bytes_wanted=131072):
         return False, "没有 requests 模块"
     url = playurl_media_url(aid, cid)
     if not url:
-        code = playurl_code(aid, cid)
+        # 拿不到地址也要分清是"被风控挑战"还是"接口真的报错" —— 前者返回码是 0,
+        # 光报"接口返回码 0"会让人以为一切正常(实测踩过)。
+        code, has_stream = playurl_probe(aid, cid)
+        if code == 0 and has_stream is False:
+            return False, "接口只给了验证凭证(v_voucher), 没有给流 —— 还在被风控挑战"
         return False, "拿不到播放地址(接口返回码 %s)" % code
     try:
         resp = session.get(url, headers={"Range": "bytes=0-%d" % (bytes_wanted - 1)},

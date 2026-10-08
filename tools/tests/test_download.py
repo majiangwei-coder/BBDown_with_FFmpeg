@@ -181,6 +181,96 @@ class TestSkipRules(DownloadTestBase):
         self.assertNotIn("1", data["跳过"])
         self.assertEqual(data["失败"]["1"]["count"], 1)
 
+    def test_risk_control_challenge_never_moves_to_skip(self):
+        """接口正在风控挑战(只给验证凭证)时, 失败 2 次也不进「跳过」.
+
+        实测(2026-10-08 凌晨): 挑战一阵一阵地来, 一轮撞掉 300 多个视频, 而
+        **同一个窗口里 BBDown 还能下成一大半** —— 照"两次就跳过"办会平白丢几百个。
+        """
+        from unittest import mock
+        from bbdown_kit import lockstep
+        self.fail_aids = {"1", "2"}
+        coll = folder("合集下载", "某某合集_1000001")
+        with mock.patch.object(download.bilitools, "can_probe_api",
+                               lambda: True), \
+                mock.patch.object(download.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (0, False)), \
+                mock.patch.object(lockstep, "BLOCK_PAUSE_SECONDS", 0):
+            for _round in range(3):      # 连跑三轮都失败(累计失败 3 次)
+                download.process_collection(None, self.spec(), self.args,
+                                            self.stats)
+        data = read_state(coll)
+        self.assertNotIn("1", data["跳过"], "被挑战不该算到视频头上")
+        self.assertNotIn("1", data["已下载"])
+        self.assertIn("1", data["失败"], "留在失败里, 下次重试")
+        self.assertGreaterEqual(data["失败"]["1"]["count"], 3)
+
+    def test_broken_video_still_moves_to_skip(self):
+        """接口说这视频本来就有问题(-404) -> 照老规矩, 两次之后进「跳过」."""
+        from unittest import mock
+        self.fail_aids = {"1", "2"}
+        with mock.patch.object(download.bilitools, "can_probe_api",
+                               lambda: True), \
+                mock.patch.object(download.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (-404, False)):
+            download.process_collection(None, self.spec(), self.args, self.stats)
+            download.process_collection(None, self.spec(), self.args, self.stats)
+        data = read_state(folder("合集下载", "某某合集_1000001"))
+        self.assertIn("1", data["跳过"])
+        self.assertIn("2", data["跳过"])
+
+    def test_manager_being_throttled_also_blocks_the_skip(self):
+        """管理器自己正在降速(连续失败到阈值)时, 也不能把失败算到视频头上.
+
+        这才是最常见的那种: 风控挑战是**按请求速率**触发的 —— 我一动不动地问
+        接口时它给流(有流=True), 而 BBDown 三路并发猛敲的时候它只给验证凭证。
+        所以判据必须包含"管理器自己已经在降速"这个信号。
+        """
+        import time
+        from unittest import mock
+        from bbdown_kit import lockstep
+        self.fail_aids = {"1", "2"}
+        # 直接把它摆到"已经降过速"的状态: 走 on_failure 会顺手把间隔拉到 5 秒,
+        # 测试就得干等(这里要验的是判据, 不是节流本身)。
+        throttle = lockstep.Throttle(1, 0.0, fail_threshold=99, pause_seconds=0)
+        throttle.backoff_level = 1
+        self.assertGreater(throttle.backoff_level, 0, "已经进入降速状态")
+        with mock.patch.object(download.bilitools, "can_probe_api",
+                               lambda: True), \
+                mock.patch.object(download.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (0, True)), \
+                mock.patch.object(lockstep, "BLOCK_PAUSE_SECONDS", 0):
+            # 接口说视频没问题, 但管理器正在降速 -> 仍然不写「跳过」
+            download.process_collection(None, self.spec(), self.args,
+                                        self.stats, throttle=throttle)
+            download.process_collection(None, self.spec(), self.args,
+                                        self.stats, throttle=throttle)
+        data = read_state(folder("合集下载", "某某合集_1000001"))
+        self.assertNotIn("1", data["跳过"], "降速期间失败不算视频的账")
+        self.assertIn("1", data["失败"])
+        # 墙过去了、管理器恢复正常 -> 真下不了的视频照样进「跳过」
+        healthy = lockstep.Throttle(1, 0.0, fail_threshold=2, pause_seconds=0)
+        with mock.patch.object(download.bilitools, "can_probe_api",
+                               lambda: True), \
+                mock.patch.object(download.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (0, True)):
+            download.process_collection(None, self.spec(), self.args,
+                                        self.stats, throttle=healthy)
+        self.assertIn("1", read_state(folder("合集下载", "某某合集_1000001"))["跳过"])
+
+    def test_no_login_means_no_probe_offline(self):
+        """没登录/离线时不许去问接口(问出来的是"未登录"), 照老规矩走."""
+        from unittest import mock
+        self.fail_aids = {"1", "2"}
+        with mock.patch.object(download.bilitools, "can_probe_api",
+                               lambda: False), \
+                mock.patch.object(download.bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (0, False)):
+            download.process_collection(None, self.spec(), self.args, self.stats)
+            download.process_collection(None, self.spec(), self.args, self.stats)
+        data = read_state(folder("合集下载", "某某合集_1000001"))
+        self.assertIn("1", data["跳过"])
+
     def test_retry_skip_requeues(self):
         coll = folder("合集下载", "某某合集_1000001")
         write_state(coll, videos=[{"aid": "1", "bvid": "BV1", "title": "标题1"}],
@@ -330,6 +420,50 @@ class TestThrottle(unittest.TestCase):
         self.assertTrue(throttle.on_success())        # 第 5 个成功 -> 恢复
         self.assertEqual(throttle.current_parallel, 3)
         self.assertEqual(throttle.interval, 2.0)
+
+    def test_block_brake_escalates_and_caps(self):
+        """撞上账号级限流/风控时的刹车: 45 秒起步, 翻倍, 封顶 2 分钟.
+
+        为什么封顶这么短: 那种挑战是短周期的(好窗口只有一两分钟), 停太久会整个
+        睡过去; 多试一次只要 1 秒。
+        """
+        throttle = self.lockstep.Throttle(3, 2.0, 99, 0)
+        self.assertEqual(throttle.pause_for_block(45), 45)
+        self.assertEqual(throttle.pause_for_block(45), 90)
+        self.assertEqual(throttle.pause_for_block(45), 120, "封顶 2 分钟")
+        self.assertEqual(throttle.pause_for_block(45), 120)
+        self.assertTrue(throttle.cooling_down(), "踩下去就得真的停")
+        self.assertLessEqual(self.lockstep.MAX_BLOCK_PAUSE, 120,
+                             "封顶再长就会睡过好窗口")
+
+    def test_block_brake_resets_after_a_success(self):
+        """能下成了 = 那堵墙散了: 刹车立刻松开, 不抱着"最多 5 分钟"干等.
+
+        好窗口只有一两分钟(实测 02:37/02:43/02:49/02:55 那种), 白等过去就白丢一批。
+        """
+        throttle = self.lockstep.Throttle(3, 2.0, 99, 0)
+        throttle.pause_for_block(60)
+        throttle.pause_for_block(60)
+        self.assertTrue(throttle.cooling_down())
+        throttle.on_success()
+        self.assertEqual(throttle.block_level, 0)
+        self.assertFalse(throttle.cooling_down(), "成功了就该马上接着下")
+        self.assertEqual(throttle.pause_for_block(60), 60)
+
+    def test_rate_limit_cooldown_is_not_cut_short_by_a_success(self):
+        """但"连续失败降速"的冷却不能被一次成功提前取消(原来的设计)."""
+        throttle = self.lockstep.Throttle(3, 2.0, 1, 600)
+        throttle.on_failure()                   # 到阈值: 降速 + 10 分钟冷却
+        self.assertTrue(throttle.cooling_down())
+        throttle.on_success()
+        self.assertTrue(throttle.cooling_down(), "降速冷却要等它自己到期")
+
+    def test_zero_pause_does_not_wait(self):
+        """测试里把刹车改成 0 秒时不能真的等(否则整个套件被拖慢)."""
+        throttle = self.lockstep.Throttle(3, 2.0, 99, 0)
+        throttle.pause_for_block(0)
+        self.assertFalse(throttle.cooling_down())
+        self.assertEqual(throttle.block_level, 1, "但刹车次数照记")
 
     def test_run_batch_counts_results(self):
         from bbdown_kit import lockstep

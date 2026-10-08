@@ -43,6 +43,10 @@ HEARTBEAT_SECONDS = 45
 SLOW_VIDEO_SECONDS = 300
 # 完全没有任何输出这么久, 提示一下(可能是接口卡住)
 SILENCE_WARN_SECONDS = 120
+# 本轮跑够这么久, 心跳里才附一个"本轮平均速度": 太短的窗口算出来没意义(而且
+# 刚开轮时主要在刷名单, 平均值会被拉得很难看)。单跳的数字会被"合并落盘"带高,
+# 平均速度不会 —— 用户拿它跟自己的带宽比才有意义。
+AVERAGE_AFTER_SECONDS = 300
 
 
 class RoundResult(object):
@@ -137,6 +141,48 @@ def heartbeat_lines(round_no, round_elapsed, result, active, now, progress=None)
         lines.append("当前没有在下的视频(正在刷新名单/准备下一批)"
                      + ("; " + progress if progress else ""))
     return lines
+
+
+def disk_growth_text(delta, secs, fresh=0, comparable=True, average=None):
+    """心跳里那句"落盘 +xx MB(46 秒, 约 x MB/s)" —— 纯函数, 好单测.
+
+    delta      两次心跳都量到的那些文件夹的**净**增长(字节, 可能为负)
+    secs       两次心跳之间过了多久
+    fresh      这次在集合里、上次不在的文件夹个数(换文件夹)
+    comparable 有没有"两次都量到"的文件夹(没有就只能说下一次才有数字)
+    average    本轮平均速度(字节/秒): 单跳的数字会被"合并落盘"带高, 这个不会
+
+    **为什么必须只算"两次都量到"的文件夹**: 刚进集合的文件夹没有基准, 拿它当
+    增长就成了"这个文件夹的存量", 于是报出比物理带宽还高几十倍的假速度 ——
+    实测踩过(2026-10-08 00:10 的守护日志):
+
+        在下的: 助眠Asmr(已 1分08秒)      -> 落盘 +172.8 MB(46 秒, 约 3.8 MB/s)
+        在下的: 吴希诺 顶(已 7秒)          -> 落盘 +97.91 GB(46 秒, 约 2.13 GB/s)
+
+    第二行是换了一批在下的文件夹(上一个 UP主 下完、开始下一个), 那个新文件夹
+    本地本来就有 105 GB, 全被当成了"这 46 秒下的"。反过来也一样坑: 集合里少了
+    一个大文件夹, 差值变负, 于是误报"这 46 秒没长个儿(可能卡了)"。
+
+    **为什么算净增长(而不是只加正数)**: BBDown 是先把分片下进
+    `<文件夹>\\<aid>\\`、再合并出成片、最后删掉分片。合并那一跳文件夹会凭空多出
+    一个成片的大小(分片还在), 删分片那一跳又少回去 —— 按净增长算这一圈自己
+    抵消, 长期平均才是真实下载速度; 只加正数会把它算成两倍(本库视频多在
+    20 MB 上下, 合并非常频繁)。单跳因此还会有点抖(合并赶在一起就偏高一点),
+    所以旁边给一个"本轮平均"当参照 —— 那个数不会超过物理带宽。
+    """
+    if not comparable:
+        return "刚开下(或刚换了一批文件夹), 下一次心跳才有落盘数字"
+    if delta <= 0:
+        if fresh:
+            return "刚换了一批在下的文件夹, 下一次心跳才有落盘数字"
+        return "这 %.0f 秒没长个儿(可能在下小文件或真的卡了)" % secs
+    text = "落盘 +%s(%.0f 秒, 约 %s/s)" % (size_text(delta), secs,
+                                          size_text(delta / secs))
+    if average:
+        text += "; 本轮平均 %s/s" % size_text(average)
+    if fresh:
+        text += "(另有 %d 个文件夹刚开始下, 没算进来)" % fresh
+    return text
 
 
 # ---------------- 事件读取 ----------------
@@ -282,8 +328,11 @@ def run_round(manager_cmd, round_no, quarantined, log_dir, round_log_path,
         "order": [],           # 老版本(没有事件流)时用来配对开始/结束
         "last_output": started,
         "last_beat": started,
-        "last_bytes": 0,       # 上次心跳时, 在下的那几个文件夹一共多大
+        # 上次心跳时"每个在下的文件夹各自多大"(算落盘增量用). 必须是按文件夹
+        # 分开的表 —— 换文件夹时整批相减会报出假速度, 见 disk_growth_text。
+        "last_bytes": {},
         "last_bytes_ts": started,
+        "bytes_seen": 0.0,     # 本轮累计量到的净增长(算"本轮平均"用)
         "last_silence_note": 0.0,
         "warned": set(),       # 已经点名过的慢视频
     }
@@ -316,11 +365,24 @@ def run_round(manager_cmd, round_no, quarantined, log_dir, round_log_path,
           · 别的失败(多线程/网络/解析/残缺)只记数、记原因, **不休息**
           · 连着好几个"不是限流"的失败也是一种信号, 但处理方式是让管理器
             自己降速, 而不是整个停下来
+          · BBDown 说不清原因时(见下面那段), 自己去问接口要一个码
         """
         if aid and bilitools.video_unplayable(aid):
             result.unplayable += 1
             _quarantine_charging(aid, title, quarantined, current_folder, log)
             return
+        # BBDown 只说了句"解析此分P失败"时, 到底是视频没了、要充电、还是账号
+        # 被风控挑战? 从这句话里看不出来(它还可能整行都是乱码)。所以自己问一次
+        # 播放接口: 返回码 + **有没有流** 一起看 —— 被风控挑战时接口返回 code=0
+        # 但只给一个验证凭证、一条流都没有(见 bilitools.playurl_probe)。
+        # (没登录就别问了, 问出来的是"未登录", 不是"被拦")
+        if (aid and kind in (failures.PARSE, failures.NOFILE, failures.UNKNOWN)
+                and bilitools.can_probe_api()):
+            verdict = failures.stream_verdict(*bilitools.playurl_probe(aid))
+            if verdict:
+                kind, why = verdict
+                note = "%s(接口实测)" % why
+                log("失败原因被接口确认: %s [%s] -> %s" % (title, aid, why))
         result.fails += 1
         result.last_failed_aid = aid
         result.fail_kinds[kind or failures.UNKNOWN] = (
@@ -473,17 +535,22 @@ def run_round(manager_cmd, round_no, quarantined, log_dir, round_log_path,
 
         folders = {entry[2] for entry in live["active"].values()
                    if len(entry) > 2 and entry[2]}
-        now_bytes = sum(folder_bytes(f) for f in folders)
-        progress = None
-        if folders and live["last_bytes"]:
-            delta = now_bytes - live["last_bytes"]
-            secs = max(1.0, now - live["last_bytes_ts"])
-            if delta > 0:
-                progress = "落盘 +%s(%.0f 秒, 约 %s/s)" % (
-                    size_text(delta), secs, size_text(delta / secs))
-            else:
-                progress = "这 %.0f 秒没长个儿(可能在下小文件或真的卡了)" % secs
-        live["last_bytes"], live["last_bytes_ts"] = now_bytes, now
+        now_map = {f: folder_bytes(f) for f in folders}
+        before = live["last_bytes"]
+        secs = max(1.0, now - live["last_bytes_ts"])
+        comparable = [f for f in now_map if f in before]
+        delta = sum(now_map[f] - before[f] for f in comparable)
+        fresh = len(now_map) - len(comparable)
+        if comparable:
+            # 本轮累计的净增长(只累"两次都量到"的); 除以本轮时长就是平均速度。
+            # 这个数比单跳稳: 合并落盘那一跳会虚高, 它不会被带偏, 也不会超过带宽。
+            live["bytes_seen"] += delta
+        elapsed = now - started
+        average = None
+        if live["bytes_seen"] > 0 and elapsed >= AVERAGE_AFTER_SECONDS:
+            average = live["bytes_seen"] / elapsed
+        progress = disk_growth_text(delta, secs, fresh, bool(comparable), average)
+        live["last_bytes"], live["last_bytes_ts"] = now_map, now
         live["last_beat"] = now
         # 拆成两行写: 数字一行(短), 在下的另起一行(标题长, 折行也不影响数字)
         hb_lines = heartbeat_lines(round_no, now - started, result,

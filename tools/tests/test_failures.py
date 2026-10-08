@@ -141,6 +141,193 @@ class TestTailCapturesOutput(unittest.TestCase):
         self.assertIn("随便什么", tail.text())
 
 
+class _FakePipe(object):
+    """冒充 BBDown 的 stdout 管道(字节, 有 read/close)."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def read(self, n=-1):
+        chunk, self.data = self.data[:n], self.data[n:]
+        return chunk
+
+    def close(self):
+        pass
+
+
+class TestTailDecodesBBDownOutput(unittest.TestCase):
+    """BBDown 的输出编码**不固定**, 必须逐行认 —— 写死 utf-8 会把中文全毁掉.
+
+    实测(2026-10-08 01:44): cp936 的控制台里 BBDown 写的是 GBK, 而这里以前是
+    `encoding="utf-8", errors="replace"` —— 一轮日志里 **6 万个 U+FFFD**, 中文
+    一个字都没剩下。后果不只是日志难看: 失败原因也认不出来, 56 个"解析此分P失败"
+    全被记成"无成片", 守护因此看不出自己正被风控。
+    """
+
+    def test_gbk_lines_are_decoded(self):
+        from bbdown_kit import download
+        raw = "解析此分P失败(开启--debug查看详细信息)\n任务完成\n".encode("gb18030")
+        lines, tail = download.split_output(raw)
+        self.assertEqual(tail, b"", "整段都以换行结束, 不该留尾巴")
+        text = "".join(lines)
+        self.assertIn("解析此分P失败", text)
+        self.assertIn("任务完成", text)
+        self.assertNotIn("\ufffd", text)
+
+    def test_utf8_lines_are_decoded_too(self):
+        """chcp 65001 的窗口里 BBDown 写 UTF-8, 这条也不能挂."""
+        from bbdown_kit import download
+        raw = "解析此分P失败\n任务完成\n".encode("utf-8")
+        lines, _tail = download.split_output(raw)
+        self.assertIn("解析此分P失败", "".join(lines))
+
+    def test_progress_refreshed_with_carriage_return_is_split(self):
+        """进度是 \\r 刷新的: 不切成一行行, 一条进度条会攒成一大坨."""
+        from bbdown_kit import download
+        raw = "下载中 1%\r下载中 2%\r下载中 3%\n".encode("gb18030")
+        lines, tail = download.split_output(raw)
+        self.assertEqual(tail, b"")
+        self.assertEqual(len(lines), 3, "回车刷新也要断行")
+        self.assertIn("下载中 3%", lines[-1])
+
+    def test_crlf_is_one_break_not_two(self):
+        from bbdown_kit import download
+        lines, _tail = download.split_output("第一行\r\n第二行\r\n".encode("utf-8"))
+        self.assertEqual(lines, ["第一行", "第二行"])
+
+    def test_incomplete_tail_is_kept_for_the_next_chunk(self):
+        """半个汉字/半行留在尾巴里, 拼上下一段再解 —— 不能丢字."""
+        from bbdown_kit import download
+        whole = "解析此分P失败".encode("gb18030")
+        lines, tail = download.split_output(whole[:5])
+        self.assertEqual(lines, [])
+        self.assertTrue(tail)
+        lines2, tail2 = download.split_output(tail + whole[5:] + b"\n")
+        self.assertEqual(tail2, b"")
+        self.assertEqual("".join(lines2), "解析此分P失败")
+
+    def test_tail_still_classifies_the_reason_after_decoding(self):
+        """整条链路: GBK 的"解析此分P失败"喂进去, reason() 要认出"解析".
+
+        以前这里会得到"无成片"(因为中文全成了乱码), 于是"是不是被风控"就看不出来了。
+        """
+        from bbdown_kit import download
+        tail = download._Tail(stream=None)
+        tail.start(_FakePipe(
+            "开始解析P1...\n解析此分P失败(开启--debug查看详细信息)\n任务完成\n"
+            .encode("gb18030")))
+        tail.join()
+        self.assertIn("解析此分P失败", tail.text())
+        self.assertNotIn("\ufffd", tail.text())
+        self.assertEqual(tail.reason()[0], failures.PARSE)
+
+    def test_text_pipe_still_works(self):
+        """万一传进来的是文本管道(替身/老调用点), 也不能崩."""
+        from bbdown_kit import download
+        tail = download._Tail(stream=None)
+        tail.start(_FakePipe("普通文本\n".encode("utf-8")))
+        tail.join()
+        self.assertIn("普通文本", tail.text())
+
+
+class TestPlayurlProbe(unittest.TestCase):
+    """播放接口的"有没有流"必须单独看 —— 返回码 0 也可能是被风控挑战.
+
+    实测(2026-10-08 02:00): 连问四个视频, 全是 code=0 但 data 里只有一个
+    v_voucher、没有 dash/durl; 而同一时间 BBDown 正在报"解析此分P失败"。
+    只看返回码的探测会把这种状态读成"已放行"(守护那句日志就是这么骗人的)。
+    """
+
+    def probe(self, payload, code=0):
+        from bbdown_kit import bilitools
+        with mock.patch.object(bilitools, "api_session",
+                               lambda: _FakeSession({"code": code, "data": payload})), \
+                mock.patch.object(bilitools, "mixin_key", lambda session: "k"):
+            return bilitools.playurl_probe("1", cid="2")
+
+    def test_voucher_only_is_no_stream(self):
+        self.assertEqual(self.probe({"v_voucher": "voucher_x"}), (0, False))
+
+    def test_dash_streams_count_as_stream(self):
+        self.assertEqual(
+            self.probe({"dash": {"video": [{"baseUrl": "http://x"}]}}), (0, True))
+
+    def test_durl_counts_as_stream(self):
+        self.assertEqual(self.probe({"durl": [{"url": "http://x"}]}), (0, True))
+
+    def test_error_code_is_passed_through(self):
+        self.assertEqual(self.probe({}, code=-352), (-352, False))
+
+    def test_playurl_ok_needs_streams_not_just_code_zero(self):
+        from bbdown_kit import bilitools
+        with mock.patch.object(bilitools, "api_session",
+                               lambda: _FakeSession({"code": 0, "data": {"v_voucher": "v"}})), \
+                mock.patch.object(bilitools, "mixin_key", lambda session: "k"):
+            self.assertFalse(bilitools.playurl_ok("1", cid="2"),
+                             "只给验证凭证 = 现在下不了, 不能说它 ok")
+        with mock.patch.object(bilitools, "api_session",
+                               lambda: _FakeSession(
+                                   {"code": 0, "data": {"durl": [{"url": "u"}]}})), \
+                mock.patch.object(bilitools, "mixin_key", lambda session: "k"):
+            self.assertTrue(bilitools.playurl_ok("1", cid="2"))
+
+
+class _FakeSession(object):
+    """只认一次 playurl 请求的假会话."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def get(self, url, params=None, timeout=None, **kw):
+        from support import FakeResponse
+        return FakeResponse(self.payload)
+
+
+class TestCodeKind(unittest.TestCase):
+    """接口返回码 -> 失败分类: BBDown 说不清时, 我们自己问接口要这个码."""
+
+    def test_rate_limit_codes(self):
+        for code in (-352, -412, -799, -509, -401, 87008):
+            kind, why = failures.code_kind(code)
+            self.assertEqual(kind, failures.RATE_LIMIT, code)
+            self.assertTrue(why)
+            self.assertTrue(failures.should_rest(kind), code)
+
+    def test_playable_and_unknown_codes_are_not_a_reason(self):
+        self.assertIsNone(failures.code_kind(0), "code 0 = 正常返回, 不是失败")
+        self.assertIsNone(failures.code_kind(None), "没探到就当没证据")
+
+    def test_parse_codes_stay_parse(self):
+        for code in (-404, -10403):
+            kind, _why = failures.code_kind(code)
+            self.assertEqual(kind, failures.PARSE, code)
+            self.assertFalse(failures.should_rest(kind), code)
+
+
+class TestStreamVerdict(unittest.TestCase):
+    """(返回码, 有没有流) -> 分类. 这是"BBDown 说不清时我们自己问接口"的翻译层."""
+
+    def test_voucher_without_streams_is_a_parse_failure_with_a_clear_note(self):
+        kind, why = failures.stream_verdict(0, False)
+        self.assertEqual(kind, failures.PARSE)
+        self.assertIn("验证凭证", why)
+        self.assertFalse(failures.should_rest(kind),
+                         "同一窗口里 BBDown 还能下成 191 个, 不该整个停下来")
+
+    def test_code_zero_with_streams_is_not_a_reason(self):
+        self.assertIsNone(failures.stream_verdict(0, True),
+                          "接口现在能给流 -> 上次失败是瞬时的, 不编原因")
+
+    def test_nothing_probed_is_not_a_reason(self):
+        self.assertIsNone(failures.stream_verdict(None, None))
+
+    def test_rate_limit_codes_still_rest(self):
+        kind, why = failures.stream_verdict(-352, False)
+        self.assertEqual(kind, failures.RATE_LIMIT)
+        self.assertTrue(failures.should_rest(kind))
+        self.assertIn("风控", why)
+
+
 class TestFailureReasonIsRecorded(TempRootTest):
     """（D）失败必须记下原因 —— 以前只记 count/time, 事后完全查不出为什么."""
 
@@ -228,10 +415,23 @@ class TestProbeUsesARealDownload(unittest.TestCase):
         with mock.patch.object(bilitools, "api_session", lambda: mock.Mock()), \
                 mock.patch.object(bilitools, "playurl_media_url",
                                   lambda aid, cid=None: None), \
-                mock.patch.object(bilitools, "playurl_code", lambda aid, cid=None: 87008):
+                mock.patch.object(bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (87008, False)):
             ok, why = bilitools.download_path_ok("1")
         self.assertFalse(ok)
         self.assertIn("87008", why)
+
+    def test_voucher_only_says_risk_control_not_ok(self):
+        """拿不到地址 + 返回码 0: 别说成"接口正常", 要说清是只给了验证凭证."""
+        from bbdown_kit import bilitools
+        with mock.patch.object(bilitools, "api_session", lambda: mock.Mock()), \
+                mock.patch.object(bilitools, "playurl_media_url",
+                                  lambda aid, cid=None: None), \
+                mock.patch.object(bilitools, "playurl_probe",
+                                  lambda aid, cid=None: (0, False)):
+            ok, why = bilitools.download_path_ok("1")
+        self.assertFalse(ok)
+        self.assertIn("验证凭证", why)
 
     def test_media_url_accepts_both_dash_and_durl(self):
         """实测这个接口按参数不同会返回 dash 或 durl, 两种都要认."""

@@ -14,9 +14,9 @@ videos\\ 下面有三个平级的大类目录, 每一类都自带 下载状态.j
 import os
 import re
 
-from . import freeze, paths, state as state_mod
+from . import duration, freeze, paths, state as state_mod
 from .logging import log
-from .orders import ORDER_TEXT
+from .orders import ORDER_TEXT, is_duration_order
 from .util import sanitize_name
 
 UP = paths.UP_NAME
@@ -216,6 +216,15 @@ def pending_of(task):
     return state_mod.pending_count(task_folder(task))
 
 
+def pending_seconds_of(task):
+    """这个任务待下载的视频总共多长(秒, 估算) —— 只用于按时长排序.
+
+    时长从哪来、估不出来时怎么退, 见 duration 模块的说明。这里只负责把任务
+    翻成它对应的文件夹。
+    """
+    return duration.pending_seconds(task_folder(task))
+
+
 def order_tasks(up_tasks, coll_tasks, single_tasks, order):
     """按 order 把三类任务排成这一轮的处理顺序."""
     if order == "name":
@@ -223,17 +232,43 @@ def order_tasks(up_tasks, coll_tasks, single_tasks, order):
     if order == "collection_first":
         return list(coll_tasks) + list(up_tasks) + list(single_tasks)
     rest = list(up_tasks) + list(coll_tasks)
-    rest.sort(key=pending_of, reverse=(order == "largest"))
+    if is_duration_order(order):
+        # 按时长排: 先把这些名单的时长统计一遍(只读状态文件, 见 duration.measure
+        # 里"为什么必须统计完再排"), 再按待下载总时长排。
+        duration.measure([task_folder(t) for t in rest])
+        rest.sort(key=pending_seconds_of, reverse=(order == "duration_large"))
+    else:
+        rest.sort(key=pending_of, reverse=(order == "largest"))
     # 单视频那点零头放最后, 免得一直插队
     return rest + list(single_tasks)
 
 
-def order_preview(tasks, n=4):
-    """给日志用: 这一轮开头要处理的几个是谁."""
-    bits = [os.path.basename(task_folder(t)) for t in tasks[:n]]
+def order_preview(tasks, n=4, durations=False):
+    """给日志用: 这一轮开头要处理的几个是谁.
+
+    durations=True(按时长排)时只列**还有得下**的那几个, 并带上估算时长:
+    按时长排的时候最前面一大串是"一个都不缺"的名单(它们确实是 0 秒, 也确实
+    该排在前面), 全列出来只会让人以为顺序排错了 —— 这一行要回答的是
+    "从哪儿开始下、大概多久"。
+    """
+    skipped = 0
+    if durations:
+        work = [t for t in tasks if pending_seconds_of(t) > 0]
+        skipped = len(tasks) - len(work)
+    else:
+        work = list(tasks)
+    bits = []
+    for task in work[:n]:
+        name = os.path.basename(task_folder(task))
+        if durations:
+            name += " ≈%s" % duration.describe(pending_seconds_of(task))
+        bits.append(name)
     text = " → ".join(bits)
-    if len(tasks) > n:
-        text += " → ... 共 %d 个" % len(tasks)
+    if len(work) > n:
+        text += (" → ... 共 %d 个有待下载" % len(work) if durations
+                 else " → ... 共 %d 个" % len(work))
+    if skipped:
+        text += "(另有 %d 个名单没有缺口)" % skipped
     return text
 
 
@@ -263,5 +298,6 @@ __all__ = [
     "folder_to_mid",
     "up_folder_for", "state_spec_from_folder", "collection_spec_from_state",
     "scan_collection_folders_specs", "build_all_tasks", "task_folder",
-    "pending_of", "order_tasks", "order_preview", "order_label",
+    "pending_of", "pending_seconds_of", "order_tasks", "order_preview",
+    "order_label",
 ]

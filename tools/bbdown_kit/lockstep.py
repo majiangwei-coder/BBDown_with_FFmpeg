@@ -9,6 +9,8 @@
 降速规则(和以前完全一致):
   · 连续失败 fail_threshold 个 -> 并发降为 1, 间隔至少 5 秒, 暂停一段时间
     (pause_seconds 逐次翻倍, 最多 30 分钟);
+  · 撞上"账号被拦"(风控挑战/限流, 见 pause_for_block) -> 直接踩一脚刹车
+    (60 秒起步, 翻倍最多 5 分钟);
   · 恢复正常后连续成功 5 个 -> 并发和间隔还原。
 暂停期间如果还有任务在跑, 就继续收结果, 而不是干等着。
 """
@@ -20,6 +22,12 @@ from .logging import log
 from .util import elapsed_text
 
 MAX_PAUSE_SECONDS = 1800
+# 撞上"账号被拦"时的刹车: 45 秒起步, 连着撞翻倍, 封顶 2 分钟。
+# 为什么封顶比"连续失败降速"短这么多: 实测那种挑战是**短周期**的 ——
+# 好的窗口只有一两分钟(每分钟能下成 30 个), 停太久会整个睡过去, 白丢一批;
+# 而多试一次的代价只有 1 秒 + 几个请求。所以宁可多试, 不要睡过头。
+BLOCK_PAUSE_SECONDS = 45
+MAX_BLOCK_PAUSE = 120
 
 
 class Throttle(object):
@@ -27,7 +35,8 @@ class Throttle(object):
 
     __slots__ = ("max_parallel", "current_parallel", "base_interval", "interval",
                  "fail_threshold", "pause_seconds", "consecutive_fail",
-                 "consecutive_ok", "backoff_level", "cooldown_until")
+                 "consecutive_ok", "backoff_level", "cooldown_until",
+                 "block_until", "block_level")
 
     def __init__(self, parallel, interval, fail_threshold, pause_seconds):
         self.max_parallel = max(1, int(parallel))
@@ -39,7 +48,9 @@ class Throttle(object):
         self.consecutive_fail = 0
         self.consecutive_ok = 0
         self.backoff_level = 0
-        self.cooldown_until = 0.0
+        self.cooldown_until = 0.0   # 连续失败降速后的冷却(原来的机制)
+        self.block_until = 0.0      # "账号被拦"刹车的截止时间(单独一份, 见下)
+        self.block_level = 0        # 这个刹车连着踩了几次(成功一次就复位)
 
     def describe(self):
         return ("初始 %d 个并行, 间隔 %.1f 秒; 连续失败 %d 个会自动降速"
@@ -62,10 +73,35 @@ class Throttle(object):
         self.cooldown_until = time.time() + pause
         return True
 
+    def pause_for_block(self, seconds=None):
+        """撞上"账号被拦"(风控挑战/限流)时踩一脚刹车. 返回这次停多少秒.
+
+        为什么不能只是降速继续跑: 实测 2026-10-08 凌晨那几小时的失败是**按时间窗**
+        来的(按分钟统计: 03:47~03:48 全成、03:50~03:52 全败、03:53~03:54 全成、
+        03:55~03:58 全败……好窗口一两分钟、坏窗口三四分钟, 大约每 6 分钟一个来回)。
+        坏窗口里 ~20 次尝试只成 0~5 个 —— 那些尝试纯属白撞, 还一直在给账号加压。
+        所以撞上就停一会儿, 等风控散了再继续: 45 秒起步, 连着撞翻倍(封顶 2 分钟),
+        下一次成功就松开(见 on_success)。
+
+        seconds 默认取模块里的 BLOCK_PAUSE_SECONDS(测试会把它改成 0, 免得干等)。
+        """
+        if seconds is None:
+            seconds = BLOCK_PAUSE_SECONDS
+        self.block_level += 1
+        pause = min(seconds * (2 ** (self.block_level - 1)), MAX_BLOCK_PAUSE)
+        self.block_until = max(self.block_until, time.time() + pause)
+        return pause
+
     def on_success(self):
         """记一次成功; 恢复得足够好就把并发/间隔还原. 返回是否刚恢复."""
         self.consecutive_fail = 0
         self.consecutive_ok += 1
+        # 能下成了 = 那堵墙散了: 刹车立刻松开, 别抱着"最多 5 分钟"干等 ——
+        # 好窗口只有一两分钟, 白等过去就白丢一批视频。
+        # 注意**只松刹车**, 不动 cooldown_until: 那是连续失败降速的冷却,
+        # 按原来的设计要等它自己到期(见 on_failure 里那段注释)。
+        self.block_until = 0.0
+        self.block_level = 0
         if (self.current_parallel < self.max_parallel
                 or self.interval > self.base_interval) and self.consecutive_ok >= 5:
             self.current_parallel = self.max_parallel
@@ -75,10 +111,10 @@ class Throttle(object):
         return False
 
     def cooling_down(self):
-        return bool(self.cooldown_until) and time.time() < self.cooldown_until
+        return time.time() < max(self.cooldown_until, self.block_until)
 
     def cooldown_left(self):
-        return max(0.0, self.cooldown_until - time.time())
+        return max(0.0, max(self.cooldown_until, self.block_until) - time.time())
 
 
 def run_batch(pending, run_one, on_result, throttle, should_stop=None):

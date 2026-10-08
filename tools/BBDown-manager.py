@@ -41,6 +41,7 @@ tools\\bbdown_kit\\ 里。双击 下载管理器.bat 跑的就是它。
   --full                强制完整拉取投稿列表(排查问题用, 会慢一些)
   --full-days <天数>     每隔多少天至少完整校验一次(默认读 下载设置.txt)
   --order <顺序>         这一轮先处理谁: collection_first/smallest/largest/name
+                         /duration_small/duration_large(后两个按**总时长**排)
   --event-log <文件>     把进度写成一行的 JSON 事件(守护用它统计, 人也可以看)
 """
 
@@ -54,8 +55,8 @@ import time
 # 让"直接双击 python 文件"和"被守护当子进程拉起"两种方式都能 import 本包
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bbdown_kit import (bilitools, config, download, orders, paths, procs,
-                        tasks, workdirs)
+from bbdown_kit import (bilitools, config, download, duration, orders, paths,
+                        procs, tasks, workdirs)
 from bbdown_kit import logging as kit_log
 from bbdown_kit.state import record_count
 from bbdown_kit.logging import highlight
@@ -546,7 +547,8 @@ def build_parser():
     ap.add_argument("--pause-seconds", type=int, default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--order", default=None,
-                    help="这一轮先处理谁: collection_first/smallest/largest/name")
+                    help="这一轮先处理谁: collection_first/smallest/largest/name"
+                         "/duration_small/duration_large(按总时长排)")
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--retry-skip", action="store_true")
     ap.add_argument("--full", action="store_true")
@@ -595,6 +597,39 @@ class Plan(object):
         return not self.tasks and not self.video and not self.collection
 
 
+def ordered_tasks(up_tasks, coll_tasks, single_tasks, args):
+    """按 order 排好这一轮的任务, 并把"先跑谁"写进日志.
+
+    "一键更新/守护"和菜单里的『全部完整校验』『重新下载所有已跳过项目』都走
+    这里 —— 以前后两个菜单项直接用文件夹名顺序, 于是 下载设置.txt 里的 order
+    设了也不生效(选了按时长排也只有一键更新那条路才按时长)。
+    """
+    ordered = tasks_mod.order_tasks(up_tasks, coll_tasks, single_tasks, args.order)
+    by_duration = orders.is_duration_order(args.order)
+    log("这一轮的处理顺序(%s): %s"
+        % (orders.order_text(args.order),
+           tasks_mod.order_preview(ordered, durations=by_duration)))
+    if by_duration:
+        # 按时长排专用的交代: 一共要下多久、有多少名单还没有时长数据。
+        # 这句是给人核对"顺序对不对、数据齐不齐"用的 —— 只影响先跑谁, 不影响下不下。
+        total, work, blank = duration.stats([tasks_mod.task_folder(t)
+                                             for t in ordered])
+        if duration.typical_seconds() <= 0:
+            # 全库一个时长都没有(老状态文件就是这样): 这时候那个"合计"只是把
+            # 缺口条数当秒数加了起来, 报出来会让人以为真的只要十几个小时 ——
+            # 不如直接说清"现在还没数据、先按条数排"。
+            log("时长统计: %d 个名单还有得下, 但一个时长数据都还没有 —— 这一轮"
+                "先按缺口条数排; 等各名单下次完整校验(默认 7 天一轮)之后就有数了。"
+                "想现在补齐: 加 --full --limit 0 跑一遍 = 只刷列表不下载" % work)
+        else:
+            log("时长统计: %d 个名单还有得下, 合计约 %s (时长来自列表接口, 顺路存的)"
+                % (work, duration.describe(total)))
+            if blank:
+                log("其中 %d 个名单还没有时长数据(下次完整校验补上, 在那之前它们"
+                    "按缺口条数排)" % blank)
+    return ordered
+
+
 def plan_all(args, reason):
     """一键更新: 三类名单全都要."""
     up_tasks, coll_tasks, single_tasks = tasks_mod.build_all_tasks()
@@ -609,10 +644,7 @@ def plan_all(args, reason):
     if single_tasks:
         log("另有单视频下载里的 %d 个零散视频一起检查"
             % single_tasks[0][1]["count"])
-    ordered = tasks_mod.order_tasks(up_tasks, coll_tasks, single_tasks, args.order)
-    log("这一轮的处理顺序(%s): %s"
-        % (orders.order_text(args.order), tasks_mod.order_preview(ordered)))
-    return Plan(tasks=ordered)
+    return Plan(tasks=ordered_tasks(up_tasks, coll_tasks, single_tasks, args))
 
 
 def collect_tasks(args, session):
@@ -662,7 +694,9 @@ def collect_tasks(args, session):
         args.yes = True
         picked = [("existing", f) for f in folders if tasks_mod.folder_to_mid(f)]
         log("已选择%s (共 %d 个UP主), 全程不再询问" % (what, len(picked)))
-        return Plan(tasks=picked)
+        # 和"一键更新"一样按设置里的 order 排(以前这里直接用文件夹名顺序,
+        # 于是选了按时长排也只有"一键更新/守护"那条路才生效)。
+        return Plan(tasks=ordered_tasks(picked, [], [], args))
     return Plan(tasks=[("existing", f) for f in choice
                        if tasks_mod.folder_to_mid(f)])
 

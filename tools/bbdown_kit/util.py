@@ -46,6 +46,22 @@ def elapsed_text(seconds):
     return "%d分%02d秒" % (seconds // 60, seconds % 60)
 
 
+def duration_text(seconds):
+    """1830 -> "30分30秒", 7380 -> "2小时03分", 200000 -> "2天7小时".
+
+    和 elapsed_text 的区别: 那个报的是"这一轮跑了多久"(最多到分, 够用);
+    这个报的是"待下载的片子总时长", 动辄几百小时 —— 写成"12345分"没法看。
+    """
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return "%d秒" % seconds
+    if seconds < 3600:
+        return "%d分%02d秒" % (seconds // 60, seconds % 60)
+    if seconds < 86400:
+        return "%d小时%02d分" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%d天%d小时" % (seconds // 86400, (seconds % 86400) // 3600)
+
+
 def size_text(num_bytes):
     """1234567 -> "1.2 MB"."""
     mb = num_bytes / 1048576.0

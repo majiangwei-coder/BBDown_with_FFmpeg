@@ -120,7 +120,8 @@ def build_parser():
                     help="深度自检(只读): 三类目录各自的账 + 有没有漏在管理之外的东西")
     ap.add_argument("--order", default=None,
                     help="这一轮先处理谁: collection_first(合集优先)/smallest"
-                         "(缺口小的优先)/largest/name; 不写就用 下载设置.txt 里的")
+                         "(缺口小的优先)/largest/duration_small(时长短的优先)/"
+                         "duration_large/name; 不写就用 下载设置.txt 里的")
     ap.add_argument("--probe-login", action="store_true",
                     help="只测一下登录状态(区分风控和真过期)")
     ap.add_argument("--probe-api", action="store_true",
@@ -336,8 +337,8 @@ class Guard(object):
         self.consecutive_lock_busy = 0
         self.block_aid = None
         self.timeout_minutes = int(settings.get("download_timeout_minutes", 30) or 0)
-        self.order = (args.order or "").strip() or settings.get("order") \
-            or orders.DEFAULT_ORDER
+        self.order = orders.normalize_order(
+            (args.order or "").strip() or settings.get("order"))
 
     # ---- 每一轮 ----
 
@@ -464,10 +465,17 @@ class Guard(object):
         log("判定被限流 (%s): 本轮用时 %s, %s, 撤回跳过 %d 个"
             % (result.killed_reason, elapsed_text(result.elapsed),
                result.summary(), reverted))
-        # 只做记录: 这个码要等它自己散, 提前重开只会又撞上
-        code = (bilitools.playurl_code(result.last_failed_aid)
-                if result.last_failed_aid else None)
-        log("现在同一个接口返回码=%s (0=已放行, 87008=还在拦)" % code)
+        # 只做记录: 这个码要等它自己散, 提前重开只会又撞上。
+        # 注意**不能只看返回码**: 被风控挑战时接口返回 0 但只给一个验证凭证、
+        # 一条流都没有 —— 光看码会说成"已放行", 于是提前重开又白撞一轮(实测踩过)。
+        if result.last_failed_aid:
+            code, has_stream = bilitools.playurl_probe(result.last_failed_aid)
+            if code == 0 and has_stream is False:
+                log("现在接口只肯给验证凭证(v_voucher), 一条流都没有 —— 还在被风控挑战")
+            elif code == 0 and has_stream:
+                log("现在接口已经能给流了(返回码 0) —— 看着是放行了")
+            else:
+                log("现在同一个接口返回码=%s (0=已放行, 87008=还在拦)" % code)
         if result.last_failed_aid:
             self.block_aid = result.last_failed_aid
         # 休息档位用完了(最久那一档也等过了): 不再无限等, 体面收工。
@@ -851,7 +859,11 @@ def main():
 
     settings = config.load_settings()
     paths.refresh_data_root(settings.get("data_root", ""))
-    ORDER_ARG = (args.order or "").strip() or None
+    # 命令行里写的顺序先归一化(中文写法、大小写都认): 这样守护日志里那一行
+    # "处理顺序: ..." 和管理器实际用的顺序永远是同一个, 也省得把一个认不出来的
+    # 值原样传给管理器。只写了空白等于没写 —— 那就交给 下载设置.txt 说了算。
+    wanted_order = (args.order or "").strip()
+    ORDER_ARG = orders.normalize_order(wanted_order) if wanted_order else None
 
     # 冻结相关命令最先处理: 它们只改一个 JSON 文件, 不拿锁、不启动下载,
     # 所以守护正在跑的时候也能用。

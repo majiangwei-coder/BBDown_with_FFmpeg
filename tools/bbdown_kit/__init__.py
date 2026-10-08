@@ -10,6 +10,7 @@
     logging     日志、颜色、机器可读事件、管道解码
     state       下载状态.json 的唯一读写契约
     media       "本地是否已有这个文件"的唯一判断
+    duration    "这一轮要下的片子总共多长"的统计(时长排序用)
     bilitools   B站接口: 登录/wbi/投稿列表/合集/播放地址探测
     procs       文件锁、进程树收尾、单实例互斥
     tasks       三份名单的盘点与任务排序
@@ -28,6 +29,6 @@ __version__ = "2.0"
 
 __all__ = [
     "util", "orders", "config", "paths", "logging", "state", "media",
-    "bilitools", "procs", "tasks", "analyze", "maintenance", "download",
-    "lockstep", "runner",
+    "duration", "bilitools", "procs", "tasks", "analyze", "maintenance",
+    "download", "lockstep", "runner",
 ]
